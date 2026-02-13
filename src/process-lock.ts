@@ -1,44 +1,33 @@
 /**
- * Process lock management for stale MCP process cleanup.
+ * Process lock management using exclusive file lock.
  *
- * Two-layer defense:
- * A. PID file management - detect and kill stale processes on startup
- * B. Orphan watchdog - auto-exit if parent process dies (ppid becomes 1)
+ * Lock file stores JSON: {pid, port, startedAt}
+ * Multi-client mode: alive processes are NOT killed — Secondary
+ * instances connect to the Primary via HTTP proxy instead.
  */
 
+import {execFileSync} from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {logger} from './logger.js';
 
-interface PidFileData {
+const LOCK_DIR = path.join(os.homedir(), '.cache', 'chrome-ai-bridge');
+const LOCK_FILE = path.join(LOCK_DIR, 'mcp.lock');
+
+let lockFd: number | null = null;
+
+export interface LockInfo {
   pid: number;
-  startedAt: string;
-  nonce: string;
+  port: number;
+  startedAt: string; // ISO 8601
+  instanceId: string; // UUID to detect PID reuse
 }
 
-// Use a fixed path under ~/.cache so it works regardless of cwd
-const PID_FILE_DIR = path.join(os.homedir(), '.cache', 'chrome-ai-bridge');
-const PID_FILE_PATH = path.join(PID_FILE_DIR, 'mcp.pid');
-
-let currentNonce: string | null = null;
-let watchdogTimer: ReturnType<typeof setInterval> | null = null;
-
-function generateNonce(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function readPidFile(): PidFileData | null {
-  try {
-    const raw = fs.readFileSync(PID_FILE_PATH, 'utf-8');
-    const data = JSON.parse(raw) as PidFileData;
-    if (typeof data.pid !== 'number' || !data.nonce) {
-      return null;
-    }
-    return data;
-  } catch {
-    return null;
-  }
+export interface PrimaryStatus {
+  alive: boolean;
+  port: number;
+  instanceId: string;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -55,123 +44,240 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Check for stale PID file and kill the old process if it's still running.
- * SIGTERM -> wait 2s -> SIGKILL if still alive.
+ * Read lock file content. Supports both JSON (new) and plain PID (legacy).
  */
-export async function cleanupStaleProcess(): Promise<void> {
-  const pidData = readPidFile();
-  if (!pidData) {
-    return;
-  }
-
-  // Don't kill ourselves
-  if (pidData.pid === process.pid) {
-    return;
-  }
-
-  if (!isProcessAlive(pidData.pid)) {
-    logger(`[process-lock] Stale PID file found (pid=${pidData.pid}, not running). Removing.`);
-    try {
-      fs.unlinkSync(PID_FILE_PATH);
-    } catch {
-      // ignore
-    }
-    return;
-  }
-
-  logger(`[process-lock] Stale process detected (pid=${pidData.pid}, started=${pidData.startedAt}). Sending SIGTERM...`);
-
+export function readLockInfo(): LockInfo | null {
   try {
-    process.kill(pidData.pid, 'SIGTERM');
+    const content = fs.readFileSync(LOCK_FILE, 'utf-8').trim();
+    if (!content) return null;
+
+    // Try JSON format first
+    if (content.startsWith('{')) {
+      const parsed = JSON.parse(content) as Partial<LockInfo>;
+      if (parsed.pid && parsed.pid > 0) {
+        return {
+          pid: parsed.pid,
+          port: parsed.port ?? 0,
+          startedAt: parsed.startedAt ?? '',
+          instanceId: parsed.instanceId ?? '',
+        };
+      }
+      return null;
+    }
+
+    // Legacy: plain PID number
+    const pid = Number(content);
+    if (Number.isFinite(pid) && pid > 0) {
+      return {pid, port: 0, startedAt: '', instanceId: ''};
+    }
+    return null;
   } catch {
-    // Process already gone
+    return null;
+  }
+}
+
+/**
+ * Check if an existing Primary is alive and reachable.
+ * Reads the lock file and checks process liveness.
+ */
+export function checkExistingPrimary(): PrimaryStatus | null {
+  const info = readLockInfo();
+  if (!info) return null;
+
+  if (!isProcessAlive(info.pid)) {
+    logger(`[process-lock] Stale lock (pid=${info.pid}, not running).`);
+    return null;
+  }
+
+  return {alive: true, port: info.port, instanceId: info.instanceId};
+}
+
+/**
+ * Try to create lock file exclusively (wx flag).
+ * Writes JSON {pid, port, startedAt}.
+ * Returns the file descriptor on success, null on EEXIST.
+ */
+function tryCreateLock(port: number, instanceId: string): number | null {
+  try {
+    fs.mkdirSync(LOCK_DIR, {recursive: true});
+    const fd = fs.openSync(LOCK_FILE, 'wx');
+    const lockInfo: LockInfo = {
+      pid: process.pid,
+      port,
+      startedAt: new Date().toISOString(),
+      instanceId,
+    };
+    fs.writeSync(fd, JSON.stringify(lockInfo));
+    return fd;
+  } catch (error: unknown) {
+    if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'EEXIST') {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Handle an existing lock file.
+ * In multi-client mode, alive processes are NOT killed.
+ * Only stale (dead process) locks are removed.
+ * Returns true if the stale lock was removed and retry is possible.
+ * Returns false if the lock holder is alive (should enter proxy mode).
+ */
+async function handleExistingLock(): Promise<boolean> {
+  const info = readLockInfo();
+
+  if (info === null) {
+    logger('[process-lock] Corrupted lock file found. Removing.');
+    try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ }
+    return true;
+  }
+
+  // Don't conflict with ourselves
+  if (info.pid === process.pid) {
+    try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ }
+    return true;
+  }
+
+  if (!isProcessAlive(info.pid)) {
+    logger(`[process-lock] Stale lock (pid=${info.pid}, not running). Removing.`);
+    try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ }
+    return true;
+  }
+
+  // Process is alive — do NOT kill. Caller should enter proxy mode.
+  logger(`[process-lock] Primary is alive (pid=${info.pid}, port=${info.port}). Cannot acquire lock.`);
+  return false;
+}
+
+/**
+ * Acquire an exclusive process lock. Call once at startup for Primary mode.
+ *
+ * Flow:
+ * 1. Try fs.openSync(LOCK_FILE, 'wx') for atomic exclusive creation
+ * 2. Success -> write JSON {pid, port, startedAt}, hold FD
+ * 3. EEXIST -> check holder; remove only if stale, retry once
+ * 4. If holder is alive -> throw (caller should enter proxy mode)
+ */
+export async function acquireLock(port: number, instanceId: string): Promise<void> {
+  const fd = tryCreateLock(port, instanceId);
+  if (fd !== null) {
+    lockFd = fd;
+    logger(`[process-lock] Lock acquired (pid=${process.pid}, port=${port}, instanceId=${instanceId.slice(0, 8)})`);
     return;
   }
 
-  // Wait up to 2 seconds for graceful shutdown
+  // Lock file exists - handle the existing holder
+  const canRetry = await handleExistingLock();
+  if (!canRetry) {
+    throw new Error('[process-lock] Primary is alive. Use proxy mode.');
+  }
+
+  // Retry once after stale removal
+  const fd2 = tryCreateLock(port, instanceId);
+  if (fd2 !== null) {
+    lockFd = fd2;
+    logger(`[process-lock] Lock acquired after cleanup (pid=${process.pid}, port=${port})`);
+    return;
+  }
+
+  throw new Error('[process-lock] Failed to acquire lock after retry');
+}
+
+/**
+ * Update the port in an existing lock file (e.g. after dynamic port fallback).
+ * Rewrites the lock file content while keeping the FD open.
+ */
+export function updateLockPort(newPort: number): void {
+  if (lockFd === null) {
+    logger('[process-lock] Cannot update port: no lock held.');
+    return;
+  }
+  const info = readLockInfo();
+  if (!info) {
+    logger('[process-lock] Cannot update port: lock file unreadable.');
+    return;
+  }
+  info.port = newPort;
+  // Truncate and rewrite
+  fs.ftruncateSync(lockFd);
+  const buf = Buffer.from(JSON.stringify(info));
+  fs.writeSync(lockFd, buf, 0, buf.length, 0);
+  logger(`[process-lock] Lock port updated to ${newPort}`);
+}
+
+/**
+ * Release the process lock. Call during shutdown.
+ */
+export function releaseLock(): void {
+  if (lockFd !== null) {
+    try { fs.closeSync(lockFd); } catch { /* ignore */ }
+    lockFd = null;
+  }
+  try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ }
+  logger('[process-lock] Lock released.');
+}
+
+/**
+ * Kill all sibling chrome-ai-bridge processes (bulk cleanup).
+ *
+ * Uses pgrep to find processes matching 'chrome-ai-bridge/build/src/main.js',
+ * excludes self and parent, then SIGTERM -> wait -> SIGKILL survivors.
+ *
+ * Returns the number of processes killed.
+ * On pgrep failure (e.g. not installed), returns 0 silently.
+ */
+export async function killSiblings(): Promise<number> {
+  let pids: number[];
+  try {
+    const output = execFileSync('pgrep', ['-f', 'chrome-ai-bridge/build/src/main.js'], {
+      encoding: 'utf-8',
+      timeout: 5000,
+    });
+    pids = output.trim().split('\n')
+      .map(s => Number(s.trim()))
+      .filter(n => Number.isFinite(n) && n > 0);
+  } catch {
+    // pgrep returns exit code 1 when no matches, or not available
+    return 0;
+  }
+
+  // Exclude self and parent (cli.mjs wrapper)
+  const selfPid = process.pid;
+  const parentPid = process.ppid;
+  const targets = pids.filter(pid => pid !== selfPid && pid !== parentPid);
+
+  if (targets.length === 0) {
+    return 0;
+  }
+
+  logger(`[process-lock] Found ${targets.length} stale sibling(s): ${targets.join(', ')}`);
+
+  // Send SIGTERM to all
+  for (const pid of targets) {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      // Process already gone
+    }
+  }
+
+  // Wait for graceful shutdown
   await sleep(2000);
 
-  if (isProcessAlive(pidData.pid)) {
-    logger(`[process-lock] Process ${pidData.pid} still alive after SIGTERM. Sending SIGKILL...`);
-    try {
-      process.kill(pidData.pid, 'SIGKILL');
-    } catch {
-      // ignore
+  // SIGKILL survivors
+  let killed = 0;
+  for (const pid of targets) {
+    if (isProcessAlive(pid)) {
+      logger(`[process-lock] Process ${pid} still alive after SIGTERM. Sending SIGKILL...`);
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // ignore
+      }
     }
-    await sleep(500);
+    killed++;
   }
 
-  logger(`[process-lock] Stale process cleanup complete.`);
-  try {
-    fs.unlinkSync(PID_FILE_PATH);
-  } catch {
-    // ignore
-  }
-}
-
-/**
- * Write current process PID file with nonce for safe removal.
- */
-export function writePidFile(): void {
-  currentNonce = generateNonce();
-  const data: PidFileData = {
-    pid: process.pid,
-    startedAt: new Date().toISOString(),
-    nonce: currentNonce,
-  };
-
-  try {
-    fs.mkdirSync(PID_FILE_DIR, {recursive: true});
-    fs.writeFileSync(PID_FILE_PATH, JSON.stringify(data, null, 2) + '\n');
-    logger(`[process-lock] PID file written (pid=${process.pid})`);
-  } catch (error) {
-    logger(`[process-lock] Failed to write PID file: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-/**
- * Remove PID file only if it belongs to the current process (matching nonce).
- */
-export function removePidFile(): void {
-  if (!currentNonce) return;
-
-  try {
-    const pidData = readPidFile();
-    if (pidData && pidData.nonce === currentNonce) {
-      fs.unlinkSync(PID_FILE_PATH);
-      logger(`[process-lock] PID file removed.`);
-    }
-  } catch {
-    // ignore - file may already be deleted
-  }
-  currentNonce = null;
-}
-
-/**
- * Install orphan watchdog: monitor ppid every 2 seconds.
- * If parent dies (ppid becomes 1 on Unix), call the shutdown callback.
- */
-export function installOrphanWatchdog(onOrphaned: () => void): void {
-  const initialPpid = process.ppid;
-
-  watchdogTimer = setInterval(() => {
-    if (process.ppid !== initialPpid) {
-      logger(`[process-lock] Parent process changed (${initialPpid} -> ${process.ppid}). Orphaned.`);
-      stopOrphanWatchdog();
-      onOrphaned();
-    }
-  }, 2000);
-
-  // Don't keep the process alive just for the watchdog
-  watchdogTimer.unref();
-}
-
-/**
- * Stop the orphan watchdog timer.
- */
-export function stopOrphanWatchdog(): void {
-  if (watchdogTimer) {
-    clearInterval(watchdogTimer);
-    watchdogTimer = null;
-  }
+  return killed;
 }
