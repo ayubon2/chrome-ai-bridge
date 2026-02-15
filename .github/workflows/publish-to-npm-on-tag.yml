@@ -32,6 +32,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Preflight checks
+        run: |
+          node -e "const pkg=require('./package.json'); for (const s of ['build','sync-server-json-version']) { if (!pkg.scripts?.[s]) { console.error('Missing npm script: '+s); process.exit(1); } }"
+          npm pack --dry-run
+
       - name: Build
         run: npm run build
 
@@ -61,6 +66,11 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Preflight checks
+        run: |
+          node -e "const pkg=require('./package.json'); for (const s of ['build','sync-server-json-version']) { if (!pkg.scripts?.[s]) { console.error('Missing npm script: '+s); process.exit(1); } }"
+          npm pack --dry-run
 
       - name: Build
         run: npm run build
