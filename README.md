@@ -263,6 +263,7 @@ npm run cdp:gemini
 | [Technical Spec](docs/SPEC.md) | Detailed architecture and implementation |
 | [Setup Guide](docs/user/setup.md) | Detailed MCP configuration |
 | [Troubleshooting](docs/user/troubleshooting.md) | Problem solving |
+| [CI Policy](docs/ci-policy.md) | Required checks and browser E2E lane policy |
 | [Technical Spec - Architecture](docs/SPEC.md#1-architecture-overview) | Extension architecture |
 
 ---
