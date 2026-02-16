@@ -1156,8 +1156,19 @@ Agent IDs are generated using a hybrid strategy:
 | Variable | Default | Validation | Description |
 |----------|---------|------------|-------------|
 | `CAI_SESSION_TTL_MINUTES` | 30 | `> 0` or fallback to default | Session expiration time |
-| `CAI_MAX_AGENTS` | 10 | `> 0` or fallback to default | Maximum concurrent agents |
+| `CAI_MAX_AGENTS` | 20 | `> 0` or fallback to default | Maximum concurrent agents |
 | `CAI_CLEANUP_INTERVAL_MINUTES` | 5 | `> 0` or fallback to default | Stale session cleanup interval |
+
+**IPC overload protection**:
+
+| Variable | Default | Validation | Description |
+|----------|---------|------------|-------------|
+| `CAI_IPC_MAX_SESSIONS` | 16 | `> 0` or fallback to default | Maximum active IPC sessions in Primary |
+| `CAI_IPC_MAX_QUEUE` | 64 | `> 0` or fallback to default | Maximum queued initialize requests |
+| `CAI_IPC_QUEUE_WAIT_TIMEOUT_MS` | 10000 | `> 0` or fallback to default | Queue wait timeout before `SERVER_BUSY_TIMEOUT` |
+| `CAI_IPC_SESSION_IDLE_MS` | 300000 | `> 0` or fallback to default | Idle session close timeout |
+| `CAI_STARTUP_PROCESS_THRESHOLD` | 8 | `> 0` or fallback to default | Startup process-count threshold that enables jitter |
+| `CAI_STARTUP_DELAY_JITTER_MS` | 1500 | `> 0` or fallback to default | Max startup jitter delay when threshold is exceeded |
 
 ### 8.4 History Recording (history.jsonl)
 

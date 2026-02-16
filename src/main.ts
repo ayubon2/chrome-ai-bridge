@@ -17,6 +17,7 @@
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
+import {execFileSync} from 'node:child_process';
 
 import {randomUUID} from 'node:crypto';
 import http from 'node:http';
@@ -44,7 +45,7 @@ import {getFastContext} from './fast-cdp/fast-context.js';
 import {cleanupAllConnections} from './fast-cdp/fast-chat.js';
 import {generateAgentId, setAgentId} from './fast-cdp/agent-context.js';
 import {cleanupStaleSessions} from './fast-cdp/session-manager.js';
-import {getSessionConfig, IPC_CONFIG} from './config.js';
+import {getIpcGuardConfig, getSessionConfig, IPC_CONFIG} from './config.js';
 import {releaseLock, tryAcquireLockSafe, checkExistingPrimary, updateLockPort} from './process-lock.js';
 import {checkPrimaryHealth, startProxyMode} from './stdio-http-proxy.js';
 
@@ -84,9 +85,41 @@ const MAX_STARTUP_ATTEMPTS = 5;
 const BASE_DELAY_MS = 300;
 const HEALTH_CHECK_RETRIES = 3;
 const HEALTH_CHECK_INTERVAL_MS = 500;
+const ipcGuardConfig = getIpcGuardConfig();
 
 const instanceId = randomUUID();
 let becamePrimary = false;
+
+function countLocalBridgeInstances(): number {
+  try {
+    const output = execFileSync('ps', ['-axo', 'command'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const lines = output.split('\n').filter(Boolean);
+    return lines.filter(
+      line =>
+        line.includes('chrome-ai-bridge') &&
+        (line.includes('build/src/main.js') || line.includes('scripts/cli.mjs')),
+    ).length;
+  } catch {
+    return 0;
+  }
+}
+
+async function applyStartupJitterIfNeeded(): Promise<void> {
+  const instanceCount = countLocalBridgeInstances();
+  if (instanceCount < ipcGuardConfig.startupProcessThreshold) {
+    return;
+  }
+  const delayMs = Math.floor(Math.random() * ipcGuardConfig.startupDelayJitterMs);
+  logger(
+    `[main] High startup concurrency detected (${instanceCount} processes). Applying jitter=${delayMs}ms.`,
+  );
+  await new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
+await applyStartupJitterIfNeeded();
 
 for (let attempt = 0; attempt < MAX_STARTUP_ATTEMPTS; attempt++) {
   // 1. Try to become Primary (non-throwing)
@@ -278,6 +311,95 @@ logDisclaimers();
 // ─── IPC HTTP server (for proxy clients) ───
 {
   const ipcTransports: Record<string, StreamableHTTPServerTransport> = {};
+  const ipcSessionLastActivity = new Map<string, number>();
+  const initQueue: Array<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  }> = [];
+  let initializingCount = 0;
+
+  const getSessionLoad = (): number =>
+    Object.keys(ipcTransports).length + initializingCount;
+
+  const touchIpcSession = (sessionId: string): void => {
+    ipcSessionLastActivity.set(sessionId, Date.now());
+  };
+
+  const cleanupIpcSession = (sessionId: string): void => {
+    if (ipcTransports[sessionId]) {
+      delete ipcTransports[sessionId];
+    }
+    ipcSessionLastActivity.delete(sessionId);
+    drainInitQueue();
+  };
+
+  function sendJsonRpcError(
+    res: http.ServerResponse,
+    code: number,
+    message: string,
+    id: string | number | null = null,
+    statusCode = 400,
+  ): void {
+    res.writeHead(statusCode).end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        error: {code, message},
+        id,
+      }),
+    );
+  }
+
+  function drainInitQueue(): void {
+    while (initQueue.length > 0 && getSessionLoad() < ipcGuardConfig.maxSessions) {
+      const waiter = initQueue.shift();
+      if (!waiter) break;
+      clearTimeout(waiter.timeout);
+      waiter.resolve();
+    }
+  }
+
+  async function waitForInitCapacity(): Promise<void> {
+    if (getSessionLoad() < ipcGuardConfig.maxSessions) {
+      return;
+    }
+    if (initQueue.length >= ipcGuardConfig.maxQueue) {
+      throw new Error('SERVER_QUEUE_FULL');
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        const index = initQueue.findIndex(item => item.resolve === resolve);
+        if (index >= 0) {
+          initQueue.splice(index, 1);
+        }
+        reject(new Error('SERVER_BUSY_TIMEOUT'));
+      }, ipcGuardConfig.queueWaitTimeoutMs);
+      timeout.unref();
+      initQueue.push({resolve, reject, timeout});
+    });
+  }
+
+  const idleCleanupTimer = setInterval(async () => {
+    const now = Date.now();
+    const staleSessionIds = Array.from(ipcSessionLastActivity.entries())
+      .filter(([, lastActivity]) => now - lastActivity > ipcGuardConfig.sessionIdleMs)
+      .map(([sessionId]) => sessionId);
+    if (staleSessionIds.length === 0) {
+      return;
+    }
+    logger(
+      `[ipc] Closing ${staleSessionIds.length} idle session(s) older than ${ipcGuardConfig.sessionIdleMs}ms.`,
+    );
+    for (const staleSessionId of staleSessionIds) {
+      try {
+        await ipcTransports[staleSessionId]?.close();
+      } catch {
+        // Ignore transport close errors and continue cleanup.
+      }
+      cleanupIpcSession(staleSessionId);
+    }
+  }, Math.max(10_000, Math.min(60_000, Math.floor(ipcGuardConfig.sessionIdleMs / 2))));
+  idleCleanupTimer.unref();
 
   const ipcServer = http.createServer(async (req, res) => {
     if (!req.url || !req.method) {
@@ -290,7 +412,15 @@ logDisclaimers();
     // Health endpoint
     if (url.pathname === IPC_CONFIG.healthPath) {
       res.writeHead(200, {'Content-Type': 'application/json'}).end(
-        JSON.stringify({status: 'ok', pid: process.pid, version, instanceId}),
+        JSON.stringify({
+          status: 'ok',
+          pid: process.pid,
+          version,
+          instanceId,
+          activeSessions: Object.keys(ipcTransports).length,
+          queuedInitializations: initQueue.length,
+          sessionCapacity: ipcGuardConfig.maxSessions,
+        }),
       );
       return;
     }
@@ -323,42 +453,55 @@ logDisclaimers();
         try {
           json = body ? JSON.parse(body) : null;
         } catch {
-          res.writeHead(400).end(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              error: {code: -32700, message: 'Parse error'},
-              id: null,
-            }),
-          );
+          sendJsonRpcError(res, -32700, 'Parse error');
           return;
         }
 
         let ipcTransport: StreamableHTTPServerTransport | undefined;
         if (sessionId && ipcTransports[sessionId]) {
           ipcTransport = ipcTransports[sessionId];
+          touchIpcSession(sessionId);
         } else if (!sessionId && isInitializeRequest(json)) {
-          ipcTransport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: newSessionId => {
-              ipcTransports[newSessionId] = ipcTransport!;
-            },
-          });
-          ipcTransport.onclose = () => {
-            if (ipcTransport?.sessionId) {
-              delete ipcTransports[ipcTransport.sessionId];
+          try {
+            await waitForInitCapacity();
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : 'SERVER_BUSY_TIMEOUT';
+            if (message === 'SERVER_QUEUE_FULL') {
+              sendJsonRpcError(res, -32002, message, null, 503);
+            } else {
+              sendJsonRpcError(res, -32001, message, null, 503);
             }
-          };
-          await server.connect(ipcTransport);
-        } else {
-          res.writeHead(400).end(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              error: {
-                code: -32000,
-                message: 'Bad Request: No valid session ID provided',
+            return;
+          }
+
+          initializingCount++;
+          try {
+            ipcTransport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => randomUUID(),
+              onsessioninitialized: newSessionId => {
+                ipcTransports[newSessionId] = ipcTransport!;
+                touchIpcSession(newSessionId);
               },
-              id: null,
-            }),
+              onsessionclosed: closedSessionId => {
+                cleanupIpcSession(closedSessionId);
+              },
+            });
+            ipcTransport.onclose = () => {
+              if (ipcTransport?.sessionId) {
+                cleanupIpcSession(ipcTransport.sessionId);
+              }
+            };
+            await server.connect(ipcTransport);
+          } finally {
+            initializingCount = Math.max(0, initializingCount - 1);
+            drainInitQueue();
+          }
+        } else {
+          sendJsonRpcError(
+            res,
+            -32000,
+            'Bad Request: No valid session ID provided',
           );
           return;
         }
@@ -391,8 +534,12 @@ logDisclaimers();
         res.writeHead(400).end('Invalid or missing session ID');
         return;
       }
+      touchIpcSession(sessionId);
       try {
         await ipcTransports[sessionId].handleRequest(req, res);
+        if (req.method === 'DELETE') {
+          cleanupIpcSession(sessionId);
+        }
       } catch (error) {
         if (!res.headersSent) {
           res.writeHead(500).end(

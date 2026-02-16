@@ -2,48 +2,24 @@
 /**
  * CLI Entry Point for chrome-ai-bridge
  *
- * This is the entry point when users run:
- *   npx chrome-ai-bridge
- *   chrome-ai-bridge (if globally installed)
- *
- * Launches the MCP server with browser globals mock:
- * - Loads browser-globals-mock.mjs BEFORE main.js
- * - Ensures chrome-devtools-frontend modules work in Node.js
- * - Simple execution: no wrapper, no hot-reload
+ * This entrypoint runs the MCP server in-process to avoid spawning an extra
+ * wrapper process per client (important for multi-pane usage).
  */
 
-import {spawn} from 'node:child_process';
-import process from 'node:process';
-import {fileURLToPath} from 'node:url';
 import path from 'node:path';
+import process from 'node:process';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 
-// Resolve paths
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const mockPath = path.join(__dirname, 'browser-globals-mock.mjs');
 const mainPath = path.join(__dirname, '..', 'build', 'src', 'main.js');
 
-// Launch MCP server with --import flag
-const child = spawn(
-  process.execPath,
-  [
-    '--import',
-    mockPath,
-    mainPath,
-    ...process.argv.slice(2), // Forward CLI arguments
-  ],
-  {
-    stdio: 'inherit',
-    env: process.env,
-  },
-);
-
-child.on('exit', (code, signal) => {
-  if (signal) {
-    process.exit(1);
-  }
-  process.exit(code ?? 0);
-});
-
-// Forward signals
-process.on('SIGTERM', () => child?.kill('SIGTERM'));
-process.on('SIGINT', () => child?.kill('SIGINT'));
+try {
+  // Ensure browser globals are defined before loading main server modules.
+  await import(pathToFileURL(mockPath).href);
+  await import(pathToFileURL(mainPath).href);
+} catch (error) {
+  const message = error instanceof Error ? error.stack || error.message : String(error);
+  console.error(`[cli] Failed to start chrome-ai-bridge: ${message}`);
+  process.exit(1);
+}

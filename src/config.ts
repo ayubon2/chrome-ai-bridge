@@ -82,3 +82,49 @@ export function getSessionConfig(): SessionConfig {
     cleanupIntervalMinutes: raw.interval > 0 ? raw.interval : 5,
   };
 }
+
+/**
+ * IPC overload protection configuration.
+ */
+export interface IpcGuardConfig {
+  /** Maximum concurrent active IPC sessions. */
+  maxSessions: number;
+  /** Maximum queued initialization requests. */
+  maxQueue: number;
+  /** Maximum queue wait time in milliseconds. */
+  queueWaitTimeoutMs: number;
+  /** Idle timeout for inactive IPC sessions in milliseconds. */
+  sessionIdleMs: number;
+  /** Start jitter when too many local instances are detected. */
+  startupDelayJitterMs: number;
+  /** Local instance count threshold that activates startup jitter. */
+  startupProcessThreshold: number;
+}
+
+/**
+ * Get IPC overload protection settings from environment variables or defaults.
+ */
+export function getIpcGuardConfig(): IpcGuardConfig {
+  const raw = {
+    maxSessions: Number(process.env.CAI_IPC_MAX_SESSIONS),
+    maxQueue: Number(process.env.CAI_IPC_MAX_QUEUE),
+    queueWaitTimeoutMs: Number(process.env.CAI_IPC_QUEUE_WAIT_TIMEOUT_MS),
+    sessionIdleMs: Number(process.env.CAI_IPC_SESSION_IDLE_MS),
+    startupDelayJitterMs: Number(process.env.CAI_STARTUP_DELAY_JITTER_MS),
+    startupProcessThreshold: Number(process.env.CAI_STARTUP_PROCESS_THRESHOLD),
+  };
+
+  return {
+    maxSessions: raw.maxSessions > 0 ? Math.floor(raw.maxSessions) : 16,
+    maxQueue: raw.maxQueue > 0 ? Math.floor(raw.maxQueue) : 64,
+    queueWaitTimeoutMs:
+      raw.queueWaitTimeoutMs > 0 ? Math.floor(raw.queueWaitTimeoutMs) : 10_000,
+    sessionIdleMs: raw.sessionIdleMs > 0 ? Math.floor(raw.sessionIdleMs) : 300_000,
+    startupDelayJitterMs:
+      raw.startupDelayJitterMs > 0 ? Math.floor(raw.startupDelayJitterMs) : 1_500,
+    startupProcessThreshold:
+      raw.startupProcessThreshold > 0
+        ? Math.floor(raw.startupProcessThreshold)
+        : 8,
+  };
+}
