@@ -99,6 +99,8 @@ export interface IpcGuardConfig {
   startupDelayJitterMs: number;
   /** Local instance count threshold that activates startup jitter. */
   startupProcessThreshold: number;
+  /** Idle timeout for Primary process in milliseconds (default: 300s). */
+  primaryIdleMs: number;
 }
 
 /**
@@ -112,10 +114,11 @@ export function getIpcGuardConfig(): IpcGuardConfig {
     sessionIdleMs: Number(process.env.CAI_IPC_SESSION_IDLE_MS),
     startupDelayJitterMs: Number(process.env.CAI_STARTUP_DELAY_JITTER_MS),
     startupProcessThreshold: Number(process.env.CAI_STARTUP_PROCESS_THRESHOLD),
+    primaryIdleMs: Number(process.env.CAI_PRIMARY_IDLE_MS),
   };
 
   return {
-    maxSessions: raw.maxSessions > 0 ? Math.floor(raw.maxSessions) : 16,
+    maxSessions: raw.maxSessions > 0 ? Math.floor(raw.maxSessions) : 6,
     maxQueue: raw.maxQueue > 0 ? Math.floor(raw.maxQueue) : 64,
     queueWaitTimeoutMs:
       raw.queueWaitTimeoutMs > 0 ? Math.floor(raw.queueWaitTimeoutMs) : 10_000,
@@ -126,5 +129,7 @@ export function getIpcGuardConfig(): IpcGuardConfig {
       raw.startupProcessThreshold > 0
         ? Math.floor(raw.startupProcessThreshold)
         : 8,
+    primaryIdleMs:
+      raw.primaryIdleMs > 0 ? Math.floor(raw.primaryIdleMs) : 300_000,
   };
 }

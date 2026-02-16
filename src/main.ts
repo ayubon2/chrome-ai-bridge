@@ -172,6 +172,12 @@ if (!becamePrimary) {
 
 // ─── Primary mode ───
 
+// Idle auto-exit tracking for Primary process
+let primaryLastActivityAt = Date.now();
+const touchPrimaryActivity = (): void => {
+  primaryLastActivityAt = Date.now();
+};
+
 // Start session cleanup timer
 const sessionConfig = getSessionConfig();
 const cleanupTimer = setInterval(async () => {
@@ -218,6 +224,7 @@ function registerTool(tool: ToolDefinition): void {
       annotations: tool.annotations,
     },
     async (params): Promise<CallToolResult> => {
+      touchPrimaryActivity();
       const guard = await toolMutex.acquire();
       try {
         logger(`${tool.name} request: ${JSON.stringify(params, null, '  ')}`);
@@ -458,6 +465,7 @@ logDisclaimers();
         }
 
         let ipcTransport: StreamableHTTPServerTransport | undefined;
+        touchPrimaryActivity();
         if (sessionId && ipcTransports[sessionId]) {
           ipcTransport = ipcTransports[sessionId];
           touchIpcSession(sessionId);
@@ -534,6 +542,7 @@ logDisclaimers();
         res.writeHead(400).end('Invalid or missing session ID');
         return;
       }
+      touchPrimaryActivity();
       touchIpcSession(sessionId);
       try {
         await ipcTransports[sessionId].handleRequest(req, res);
@@ -581,6 +590,21 @@ logDisclaimers();
   });
 
   ipcServer.listen(IPC_CONFIG.port, IPC_CONFIG.host, onListening);
+
+  // Primary idle auto-exit: exit when no activity and no active IPC sessions
+  const primaryIdleCheckTimer = setInterval(() => {
+    const activeSessionCount = Object.keys(ipcTransports).length;
+    if (
+      Date.now() - primaryLastActivityAt > ipcGuardConfig.primaryIdleMs &&
+      activeSessionCount === 0
+    ) {
+      logger(
+        `[main] Primary idle for ${Math.round((Date.now() - primaryLastActivityAt) / 1000)}s with 0 active sessions. Auto-exiting.`,
+      );
+      shutdown('idle timeout');
+    }
+  }, 30_000);
+  primaryIdleCheckTimer.unref();
 }
 
 // Graceful shutdown handler with timeout

@@ -1163,12 +1163,24 @@ Agent IDs are generated using a hybrid strategy:
 
 | Variable | Default | Validation | Description |
 |----------|---------|------------|-------------|
-| `CAI_IPC_MAX_SESSIONS` | 16 | `> 0` or fallback to default | Maximum active IPC sessions in Primary |
+| `CAI_IPC_MAX_SESSIONS` | 6 | `> 0` or fallback to default | Maximum active IPC sessions in Primary |
 | `CAI_IPC_MAX_QUEUE` | 64 | `> 0` or fallback to default | Maximum queued initialize requests |
 | `CAI_IPC_QUEUE_WAIT_TIMEOUT_MS` | 10000 | `> 0` or fallback to default | Queue wait timeout before `SERVER_BUSY_TIMEOUT` |
 | `CAI_IPC_SESSION_IDLE_MS` | 300000 | `> 0` or fallback to default | Idle session close timeout |
 | `CAI_STARTUP_PROCESS_THRESHOLD` | 8 | `> 0` or fallback to default | Startup process-count threshold that enables jitter |
 | `CAI_STARTUP_DELAY_JITTER_MS` | 1500 | `> 0` or fallback to default | Max startup jitter delay when threshold is exceeded |
+
+**Idle auto-exit** (process lifecycle):
+
+| Variable | Default | Validation | Description |
+|----------|---------|------------|-------------|
+| `CAI_PRIMARY_IDLE_MS` | 300000 | `> 0` or fallback to default | Primary process idle timeout (exits after this duration with no activity AND 0 active IPC sessions) |
+
+**How idle auto-exit works:**
+
+- **Primary only**: Tracks last tool call and IPC request. If no activity for `primaryIdleMs` AND no active IPC sessions, calls `shutdown()` for graceful exit.
+- **Proxy**: No idle auto-exit. Proxy processes are lightweight (stdio-to-HTTP bridge) and exit naturally when Claude Code closes stdin.
+- This prevents resource exhaustion from the Primary holding Chrome extension connections when all sessions are idle.
 
 ### 8.4 History Recording (history.jsonl)
 
