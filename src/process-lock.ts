@@ -151,6 +151,34 @@ async function handleExistingLock(): Promise<boolean> {
 }
 
 /**
+ * Try to acquire lock without throwing on failure.
+ * Returns true if lock acquired, false if another process holds it.
+ * Used by the retry-based startup loop in main.ts.
+ */
+export async function tryAcquireLockSafe(port: number, instanceId: string): Promise<boolean> {
+  const fd = tryCreateLock(port, instanceId);
+  if (fd !== null) {
+    lockFd = fd;
+    logger(`[process-lock] Lock acquired (pid=${process.pid}, port=${port}, instanceId=${instanceId.slice(0, 8)})`);
+    return true;
+  }
+
+  const canRetry = await handleExistingLock();
+  if (!canRetry) {
+    return false;
+  }
+
+  const fd2 = tryCreateLock(port, instanceId);
+  if (fd2 !== null) {
+    lockFd = fd2;
+    logger(`[process-lock] Lock acquired after cleanup (pid=${process.pid}, port=${port})`);
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Acquire an exclusive process lock. Call once at startup for Primary mode.
  *
  * Flow:

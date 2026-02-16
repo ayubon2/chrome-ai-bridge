@@ -45,7 +45,7 @@ import {cleanupAllConnections} from './fast-cdp/fast-chat.js';
 import {generateAgentId, setAgentId} from './fast-cdp/agent-context.js';
 import {cleanupStaleSessions} from './fast-cdp/session-manager.js';
 import {getSessionConfig, IPC_CONFIG} from './config.js';
-import {acquireLock, releaseLock, killSiblings, checkExistingPrimary, updateLockPort} from './process-lock.js';
+import {releaseLock, tryAcquireLockSafe, checkExistingPrimary, updateLockPort} from './process-lock.js';
 import {checkPrimaryHealth, startProxyMode} from './stdio-http-proxy.js';
 
 function readPackageJson(): {version?: string} {
@@ -75,32 +75,69 @@ logger(`Starting Chrome AI Bridge v${version} (Extension-only mode)`);
 const agentId = generateAgentId();
 setAgentId(agentId);
 
-// ─── Multi-client routing ───
-// Check if a Primary instance is already running.
-// If yes and healthy, enter proxy mode (never returns).
-const existingPrimary = checkExistingPrimary();
-if (existingPrimary && existingPrimary.port > 0) {
-  const healthy = await checkPrimaryHealth(existingPrimary.port);
-  if (healthy) {
-    logger(`[main] Primary is healthy (port=${existingPrimary.port}). Entering proxy mode.`);
-    await startProxyMode(existingPrimary.port); // never returns
+// ─── Multi-client routing with retry ───
+// Handles concurrent startup of many processes (e.g. tproj 16-pane scenario).
+// Each process tries to become Primary or fall back to Proxy mode,
+// with exponential backoff + jitter to avoid thundering herd.
+
+const MAX_STARTUP_ATTEMPTS = 5;
+const BASE_DELAY_MS = 300;
+const HEALTH_CHECK_RETRIES = 3;
+const HEALTH_CHECK_INTERVAL_MS = 500;
+
+const instanceId = randomUUID();
+let becamePrimary = false;
+
+for (let attempt = 0; attempt < MAX_STARTUP_ATTEMPTS; attempt++) {
+  // 1. Try to become Primary (non-throwing)
+  const lockAcquired = await tryAcquireLockSafe(IPC_CONFIG.port, instanceId);
+  if (lockAcquired) {
+    becamePrimary = true;
+    break;
   }
-  logger(`[main] Primary (port=${existingPrimary.port}) not healthy. Starting as Primary.`);
+
+  // 2. Lock held by another process — try to connect as Proxy
+  const existingPrimary = checkExistingPrimary();
+  if (existingPrimary && existingPrimary.port > 0) {
+    for (let hc = 0; hc < HEALTH_CHECK_RETRIES; hc++) {
+      const healthy = await checkPrimaryHealth(existingPrimary.port);
+      if (healthy) {
+        logger(`[main] Primary is healthy (port=${existingPrimary.port}). Entering proxy mode.`);
+        await startProxyMode(existingPrimary.port); // never returns
+      }
+      if (hc < HEALTH_CHECK_RETRIES - 1) {
+        const jitter = Math.random() * HEALTH_CHECK_INTERVAL_MS;
+        await new Promise(r => setTimeout(r, HEALTH_CHECK_INTERVAL_MS + jitter));
+      }
+    }
+    logger(`[main] Primary (port=${existingPrimary.port}) not healthy after ${HEALTH_CHECK_RETRIES} retries.`);
+  }
+
+  // 3. Neither Primary nor Proxy — backoff with jitter and retry
+  if (attempt < MAX_STARTUP_ATTEMPTS - 1) {
+    const backoff = BASE_DELAY_MS * Math.pow(2, attempt);
+    const jitter = Math.random() * BASE_DELAY_MS;
+    const delay = backoff + jitter;
+    logger(`[main] Startup attempt ${attempt + 1}/${MAX_STARTUP_ATTEMPTS} failed. Retrying in ${Math.round(delay)}ms...`);
+    await new Promise(r => setTimeout(r, delay));
+  }
+}
+
+if (!becamePrimary) {
+  // Final fallback: one last proxy attempt before giving up
+  const existingPrimary = checkExistingPrimary();
+  if (existingPrimary && existingPrimary.port > 0) {
+    const healthy = await checkPrimaryHealth(existingPrimary.port);
+    if (healthy) {
+      logger(`[main] Final fallback: entering proxy mode (port=${existingPrimary.port}).`);
+      await startProxyMode(existingPrimary.port); // never returns
+    }
+  }
+  logger('[main] Failed to start as Primary or Proxy after all retries. Exiting.');
+  process.exit(1);
 }
 
 // ─── Primary mode ───
-
-// Kill all stale sibling processes first
-const killed = await killSiblings();
-if (killed > 0) {
-  logger(`[process-lock] Killed ${killed} stale sibling process(es)`);
-}
-
-// Generate a unique instance ID (survives PID reuse)
-const instanceId = randomUUID();
-
-// Acquire exclusive process lock (writes port + instanceId to lock file)
-await acquireLock(IPC_CONFIG.port, instanceId);
 
 // Start session cleanup timer
 const sessionConfig = getSessionConfig();

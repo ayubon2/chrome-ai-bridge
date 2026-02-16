@@ -78,7 +78,7 @@ export function getSessionConfig(): SessionConfig {
   };
   return {
     sessionTtlMinutes: raw.ttl > 0 ? raw.ttl : 30,
-    maxAgents: raw.max > 0 ? Math.floor(raw.max) : 10,
+    maxAgents: raw.max > 0 ? Math.floor(raw.max) : 20,
     cleanupIntervalMinutes: raw.interval > 0 ? raw.interval : 5,
   };
 }
