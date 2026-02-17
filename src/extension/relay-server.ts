@@ -130,7 +130,13 @@ export class RelayServer extends EventEmitter {
       this.handleMessage(data.toString());
     });
 
+    // Guard: only update state if this socket is still the current one.
+    // Prevents a stale socket's close event from corrupting a newer connection.
     ws.on('close', () => {
+      if (this.ws !== ws) {
+        debugLog('[RelayServer] Stale socket closed (ignored — already replaced)');
+        return;
+      }
       debugLog('[RelayServer] Extension disconnected');
       this.stopKeepAlive();
       this.rejectPendingRequests(
@@ -402,10 +408,19 @@ export class RelayServer extends EventEmitter {
    * Stop server
    */
   async stop(): Promise<void> {
+    this.stopKeepAlive();
+
     if (this.ws) {
-      this.ws.close();
+      try {
+        this.ws.close();
+      } catch {
+        // ignore close errors
+      }
       this.ws = null;
     }
+    this.ready = false;
+    this.tabId = null;
+
     this.rejectPendingRequests(
       new Error('RELAY_STOPPED: Relay stopped before request completion'),
     );
@@ -419,6 +434,7 @@ export class RelayServer extends EventEmitter {
     if (this.wss) {
       return new Promise((resolve) => {
         this.wss!.close(() => {
+          this.wss = null;
           debugLog('[RelayServer] Server stopped');
           resolve();
         });
@@ -473,6 +489,7 @@ export class RelayServer extends EventEmitter {
   isReady(): boolean {
     return this.ready;
   }
+
 
   getConnectionURL(): string {
     return `ws://${this.host}:${this.port}?token=${this.token}&sid=${encodeURIComponent(this.sessionId)}`;

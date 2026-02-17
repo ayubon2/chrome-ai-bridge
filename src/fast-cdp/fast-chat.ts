@@ -256,22 +256,54 @@ async function rotateHistoryIfNeeded(): Promise<void> {
 
 /**
  * キャッシュされたGeminiクライアントをクリア（リトライ用）
+ * @deprecated Use resetConnection('gemini') instead
  */
-export function clearGeminiClient(): void {
-  const client = getClientFromAgent('gemini');
-  const relay = getRelayFromAgent('gemini');
+export async function clearGeminiClient(): Promise<void> {
+  await resetConnection('gemini');
+}
 
+/**
+ * 指定 kind の接続を協調的にクリーンアップする。
+ * RelayServer・CdpClient・SessionManager・CDP リスナーを一括リセット。
+ * 接続失敗時のリトライ前に呼ぶことで「スティッキーな障害状態」を防ぐ。
+ */
+export async function resetConnection(kind: 'chatgpt' | 'gemini'): Promise<void> {
+  const label = kind === 'chatgpt' ? 'ChatGPT' : 'Gemini';
+  console.error(`[fast-cdp] resetConnection(${kind}) — coordinated cleanup start`);
+
+  // 1. CdpClient: all CDP event listeners removed
+  const client = getClientFromAgent(kind);
   if (client) {
-    console.error('[Gemini] Cached client cleared');
+    try {
+      client.removeAllCdpListeners();
+    } catch {
+      // ignore
+    }
+    console.error(`[${label}] CdpClient listeners removed`);
   }
+
+  // 2. RelayServer: stop + reference clear (await to ensure port is released)
+  const relay = getRelayFromAgent(kind);
   if (relay) {
     try {
-      relay.stop();
+      await relay.stop();
     } catch {
       // ignore stop errors
     }
+    console.error(`[${label}] RelayServer stopped`);
   }
-  setClientForAgent('gemini', null, null);
+
+  // 3. Agent connection reference clear
+  setClientForAgent(kind, null, null);
+  console.error(`[${label}] Agent connection references cleared`);
+
+  // 4. Session info clear (await to prevent write race on retry)
+  try {
+    await clearAgentSession(kind);
+  } catch {
+    // ignore session clear errors
+  }
+  console.error(`[fast-cdp] resetConnection(${kind}) — cleanup complete`);
 }
 
 /**
@@ -487,7 +519,9 @@ async function createConnection(kind: 'chatgpt' | 'gemini'): Promise<CdpClient> 
       logWarn('fast-chat', `${kind} existing tab not found`, {
         error: error instanceof Error ? error.message : String(error),
       });
-      console.error(`[fast-cdp] ${kind} existing tab not found, will create new tab`);
+      console.error(`[fast-cdp] ${kind} existing tab not found, resetting before new tab`);
+      // 再利用失敗 → stale 参照をクリアしてから新規タブへ
+      await resetConnection(kind);
     }
   }
 
@@ -550,7 +584,9 @@ async function createConnection(kind: 'chatgpt' | 'gemini'): Promise<CdpClient> 
       console.error(`[fast-cdp] ${kind} new tab attempt ${attempt + 1} failed:`, lastError.message);
 
       if (attempt < 1) {
-        console.error(`[fast-cdp] Retrying in 1s...`);
+        // リトライ前に協調クリーンアップして stale 状態を排除
+        console.error(`[fast-cdp] Resetting ${kind} connection before retry...`);
+        await resetConnection(kind);
         await new Promise(r => setTimeout(r, 1000));
       }
     }
@@ -578,24 +614,10 @@ export async function getClient(kind: 'chatgpt' | 'gemini'): Promise<CdpClient> 
       return existing;
     }
 
-    // 接続が切れている → 古いRelayServerをクリーンアップ
+    // 接続が切れている → 協調クリーンアップして再接続
     logConnectionState(kind, 'reconnecting');
-    console.error(`[fast-cdp] ${kind} connection lost, reconnecting...`);
-
-    // 古いRelayServerを停止
-    const oldRelay = getRelayFromAgent(kind);
-    if (oldRelay) {
-      logInfo('fast-chat', `Stopping stale ${kind} RelayServer`);
-      console.error(`[fast-cdp] Stopping stale ${kind} RelayServer`);
-      await oldRelay.stop().catch((err) => {
-        logWarn('fast-chat', `Failed to stop stale ${kind} RelayServer`, {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    }
-
-    // キャッシュをクリア
-    setClientForAgent(kind, null, null);
+    console.error(`[fast-cdp] ${kind} connection lost, performing coordinated reset...`);
+    await resetConnection(kind);
   }
 
   // 新しい接続を作成
@@ -2540,9 +2562,8 @@ async function askGeminiFastInternal(question: string, debug?: boolean): Promise
       if (stuckCheckResult.isStuck) {
         console.error(`[Gemini] Existing chat appears stuck (stop button detected for ${stuckCheckResult.waitedMs}ms). Clearing session and retrying.`);
 
-        // セッションとクライアントをクリア
-        await clearAgentSession('gemini');
-        clearGeminiClient();
+        // 協調クリーンアップ（RelayServer + Client + Session を一括リセット）
+        await resetConnection('gemini');
 
         // エラーを投げて、呼び出し元でリトライを促す
         throw new Error('GEMINI_STUCK_EXISTING_CHAT: Previous chat appears stuck (stop button visible). Session cleared, please retry.');
@@ -2845,9 +2866,8 @@ async function askGeminiFastInternal(question: string, debug?: boolean): Promise
     if (stopButtonConsecutiveCount >= forceNewChatThreshold) {
       console.error(`[Gemini] Stop button detected for ${forceNewChatThreshold * 0.5}s - clearing session and forcing new chat`);
 
-      // セッションとクライアントをクリアして新規チャットを強制
-      await clearAgentSession('gemini');
-      clearGeminiClient();
+      // 協調クリーンアップ（RelayServer + Client + Session を一括リセット）
+      await resetConnection('gemini');
 
       // エラーを投げて再試行を促す
       throw new Error('GEMINI_STUCK_STOP_BUTTON: Previous response appears stuck. Session cleared, please retry.');
