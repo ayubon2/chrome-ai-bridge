@@ -1163,12 +1163,14 @@ Agent IDs are generated using a hybrid strategy:
 
 | Variable | Default | Validation | Description |
 |----------|---------|------------|-------------|
-| `CAI_IPC_MAX_SESSIONS` | 6 | `> 0` or fallback to default | Maximum active IPC sessions in Primary |
+| `CAI_IPC_MAX_SESSIONS` | 20 | `> 0` or fallback to default | Maximum active IPC sessions in Primary |
+| `CAI_IPC_RESERVED_INIT_SLOTS` | 2 | `>= 0` or fallback to default | Number of queued initialize waiters allowed when capacity is full |
 | `CAI_IPC_MAX_QUEUE` | 64 | `> 0` or fallback to default | Maximum queued initialize requests |
-| `CAI_IPC_QUEUE_WAIT_TIMEOUT_MS` | 10000 | `> 0` or fallback to default | Queue wait timeout before `SERVER_BUSY_TIMEOUT` |
-| `CAI_IPC_SESSION_IDLE_MS` | 300000 | `> 0` or fallback to default | Idle session close timeout |
+| `CAI_IPC_QUEUE_WAIT_TIMEOUT_MS` | 45000 | `> 0` or fallback to default | Queue wait timeout before `SERVER_BUSY_TIMEOUT` |
+| `CAI_IPC_SESSION_IDLE_MS` | 120000 | `> 0` or fallback to default | Idle session close timeout |
 | `CAI_STARTUP_PROCESS_THRESHOLD` | 8 | `> 0` or fallback to default | Startup process-count threshold that enables jitter |
 | `CAI_STARTUP_DELAY_JITTER_MS` | 1500 | `> 0` or fallback to default | Max startup jitter delay when threshold is exceeded |
+| `CAI_EXEC_MAX_CONCURRENCY` | 3 | `> 0` or fallback to default | Maximum concurrent tool executions in Primary |
 
 **Idle auto-exit** (process lifecycle):
 

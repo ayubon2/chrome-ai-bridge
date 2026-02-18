@@ -89,6 +89,8 @@ export function getSessionConfig(): SessionConfig {
 export interface IpcGuardConfig {
   /** Maximum concurrent active IPC sessions. */
   maxSessions: number;
+  /** Number of initialize waiters allowed while session capacity is full. */
+  reservedInitSlots: number;
   /** Maximum queued initialization requests. */
   maxQueue: number;
   /** Maximum queue wait time in milliseconds. */
@@ -101,6 +103,8 @@ export interface IpcGuardConfig {
   startupProcessThreshold: number;
   /** Idle timeout for Primary process in milliseconds (default: 300s). */
   primaryIdleMs: number;
+  /** Maximum number of concurrent tool executions in the Primary process. */
+  execMaxConcurrency: number;
 }
 
 /**
@@ -109,20 +113,24 @@ export interface IpcGuardConfig {
 export function getIpcGuardConfig(): IpcGuardConfig {
   const raw = {
     maxSessions: Number(process.env.CAI_IPC_MAX_SESSIONS),
+    reservedInitSlots: Number(process.env.CAI_IPC_RESERVED_INIT_SLOTS),
     maxQueue: Number(process.env.CAI_IPC_MAX_QUEUE),
     queueWaitTimeoutMs: Number(process.env.CAI_IPC_QUEUE_WAIT_TIMEOUT_MS),
     sessionIdleMs: Number(process.env.CAI_IPC_SESSION_IDLE_MS),
     startupDelayJitterMs: Number(process.env.CAI_STARTUP_DELAY_JITTER_MS),
     startupProcessThreshold: Number(process.env.CAI_STARTUP_PROCESS_THRESHOLD),
     primaryIdleMs: Number(process.env.CAI_PRIMARY_IDLE_MS),
+    execMaxConcurrency: Number(process.env.CAI_EXEC_MAX_CONCURRENCY),
   };
 
   return {
-    maxSessions: raw.maxSessions > 0 ? Math.floor(raw.maxSessions) : 6,
+    maxSessions: raw.maxSessions > 0 ? Math.floor(raw.maxSessions) : 20,
+    reservedInitSlots:
+      raw.reservedInitSlots >= 0 ? Math.floor(raw.reservedInitSlots) : 2,
     maxQueue: raw.maxQueue > 0 ? Math.floor(raw.maxQueue) : 64,
     queueWaitTimeoutMs:
-      raw.queueWaitTimeoutMs > 0 ? Math.floor(raw.queueWaitTimeoutMs) : 10_000,
-    sessionIdleMs: raw.sessionIdleMs > 0 ? Math.floor(raw.sessionIdleMs) : 300_000,
+      raw.queueWaitTimeoutMs > 0 ? Math.floor(raw.queueWaitTimeoutMs) : 45_000,
+    sessionIdleMs: raw.sessionIdleMs > 0 ? Math.floor(raw.sessionIdleMs) : 120_000,
     startupDelayJitterMs:
       raw.startupDelayJitterMs > 0 ? Math.floor(raw.startupDelayJitterMs) : 1_500,
     startupProcessThreshold:
@@ -131,5 +139,7 @@ export function getIpcGuardConfig(): IpcGuardConfig {
         : 8,
     primaryIdleMs:
       raw.primaryIdleMs > 0 ? Math.floor(raw.primaryIdleMs) : 300_000,
+    execMaxConcurrency:
+      raw.execMaxConcurrency > 0 ? Math.floor(raw.execMaxConcurrency) : 3,
   };
 }

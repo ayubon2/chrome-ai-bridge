@@ -165,18 +165,21 @@ Check the output for:
 
 ### Many panes / many MCP clients (OOM or timeout under load)
 
-When running 8-16 panes at once, tune IPC overload protection on the Primary:
+When running many panes at once, tune IPC overload protection on the Primary:
 
 ```bash
-export CAI_IPC_MAX_SESSIONS=16
+export CAI_IPC_MAX_SESSIONS=20
+export CAI_IPC_RESERVED_INIT_SLOTS=2
 export CAI_IPC_MAX_QUEUE=64
-export CAI_IPC_QUEUE_WAIT_TIMEOUT_MS=10000
-export CAI_IPC_SESSION_IDLE_MS=300000
+export CAI_IPC_QUEUE_WAIT_TIMEOUT_MS=45000
+export CAI_IPC_SESSION_IDLE_MS=120000
+export CAI_EXEC_MAX_CONCURRENCY=3
 export CAI_STARTUP_PROCESS_THRESHOLD=8
 export CAI_STARTUP_DELAY_JITTER_MS=1500
 ```
 
 Expected overload errors:
+- `SERVER_CAPACITY_EXCEEDED`: session capacity is full and no initialize waiter slot is available
 - `SERVER_QUEUE_FULL`: initialize queue is full
 - `SERVER_BUSY_TIMEOUT`: queued initialize request waited too long
 
@@ -184,7 +187,7 @@ Recommended startup sequence for large tmux workspaces:
 1. Start 2 panes -> verify basic tool call
 2. Scale to 4 panes -> verify health
 3. Scale to 8 panes -> verify no repeated reconnect loops
-4. Scale to 16 panes
+4. Scale to 20 panes
 
 ## Debug Mode
 

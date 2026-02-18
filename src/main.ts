@@ -89,6 +89,8 @@ const ipcGuardConfig = getIpcGuardConfig();
 
 const instanceId = randomUUID();
 let becamePrimary = false;
+let stdinClosed = false;
+let getActiveIpcSessionCount = (): number => 0;
 
 function countLocalBridgeInstances(): number {
   try {
@@ -213,7 +215,7 @@ Available tools: ask_chatgpt_web, ask_gemini_web, ask_chatgpt_gemini_web, take_c
   );
 };
 
-const toolMutex = new Mutex();
+const toolMutex = new Mutex(ipcGuardConfig.execMaxConcurrency);
 
 function registerTool(tool: ToolDefinition): void {
   server.registerTool(
@@ -326,8 +328,12 @@ logDisclaimers();
   }> = [];
   let initializingCount = 0;
 
+  const getActiveSessionCount = (): number =>
+    Object.keys(ipcTransports).length;
+  getActiveIpcSessionCount = getActiveSessionCount;
+
   const getSessionLoad = (): number =>
-    Object.keys(ipcTransports).length + initializingCount;
+    getActiveSessionCount() + initializingCount;
 
   const touchIpcSession = (sessionId: string): void => {
     ipcSessionLastActivity.set(sessionId, Date.now());
@@ -339,6 +345,7 @@ logDisclaimers();
     }
     ipcSessionLastActivity.delete(sessionId);
     drainInitQueue();
+    maybeShutdownAfterStdinClose('ipc session cleanup');
   };
 
   function sendJsonRpcError(
@@ -369,6 +376,13 @@ logDisclaimers();
   async function waitForInitCapacity(): Promise<void> {
     if (getSessionLoad() < ipcGuardConfig.maxSessions) {
       return;
+    }
+    const initWaiterLimit = Math.max(
+      0,
+      Math.min(ipcGuardConfig.reservedInitSlots, ipcGuardConfig.maxQueue),
+    );
+    if (initQueue.length >= initWaiterLimit) {
+      throw new Error('SERVER_CAPACITY_EXCEEDED');
     }
     if (initQueue.length >= ipcGuardConfig.maxQueue) {
       throw new Error('SERVER_QUEUE_FULL');
@@ -424,9 +438,11 @@ logDisclaimers();
           pid: process.pid,
           version,
           instanceId,
-          activeSessions: Object.keys(ipcTransports).length,
+          activeSessions: getActiveSessionCount(),
           queuedInitializations: initQueue.length,
           sessionCapacity: ipcGuardConfig.maxSessions,
+          reservedInitSlots: ipcGuardConfig.reservedInitSlots,
+          execMaxConcurrency: ipcGuardConfig.execMaxConcurrency,
         }),
       );
       return;
@@ -475,7 +491,9 @@ logDisclaimers();
           } catch (error) {
             const message =
               error instanceof Error ? error.message : 'SERVER_BUSY_TIMEOUT';
-            if (message === 'SERVER_QUEUE_FULL') {
+            if (message === 'SERVER_CAPACITY_EXCEEDED') {
+              sendJsonRpcError(res, -32003, message, null, 503);
+            } else if (message === 'SERVER_QUEUE_FULL') {
               sendJsonRpcError(res, -32002, message, null, 503);
             } else {
               sendJsonRpcError(res, -32001, message, null, 503);
@@ -593,7 +611,7 @@ logDisclaimers();
 
   // Primary idle auto-exit: exit when no activity and no active IPC sessions
   const primaryIdleCheckTimer = setInterval(() => {
-    const activeSessionCount = Object.keys(ipcTransports).length;
+    const activeSessionCount = getActiveSessionCount();
     if (
       Date.now() - primaryLastActivityAt > ipcGuardConfig.primaryIdleMs &&
       activeSessionCount === 0
@@ -657,9 +675,38 @@ async function shutdown(reason: string): Promise<void> {
   process.exit(0);
 }
 
+function maybeShutdownAfterStdinClose(trigger: string): void {
+  if (!stdinClosed || isShuttingDown) {
+    return;
+  }
+  const activeSessionCount = getActiveIpcSessionCount();
+  if (activeSessionCount > 0) {
+    return;
+  }
+  logger(
+    `[main] ${trigger}: stdin already closed and all IPC sessions drained. Shutting down.`,
+  );
+  void shutdown('stdin closed (all IPC sessions drained)');
+}
+
+function handleStdinClosed(reason: string): void {
+  stdinClosed = true;
+  if (isShuttingDown) {
+    return;
+  }
+  const activeSessionCount = getActiveIpcSessionCount();
+  if (activeSessionCount > 0) {
+    logger(
+      `[main] ${reason}: deferring shutdown while ${activeSessionCount} IPC session(s) remain.`,
+    );
+    return;
+  }
+  void shutdown(reason);
+}
+
 // stdin close = Claude Code disconnected (most reliable on Windows too)
-process.stdin.on('end', () => shutdown('stdin ended'));
-process.stdin.on('close', () => shutdown('stdin closed'));
+process.stdin.on('end', () => handleStdinClosed('stdin ended'));
+process.stdin.on('close', () => handleStdinClosed('stdin closed'));
 
 // Signal handlers
 process.on('SIGTERM', () => shutdown('SIGTERM'));
