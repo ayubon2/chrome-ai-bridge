@@ -340,48 +340,71 @@ class TabShareExtension {
       logInfo('relay', 'Replacing stale pending connection', {pendingKey, sessionId, selectorTabId});
       existingPending.connection.close('Pending connection replaced');
       this._pendingTabSelection.delete(pendingKey);
+      ensureKeepAliveAlarm('replace-stale-pending');
     }
     logInfo('relay', 'Connecting to relay', {mcpRelayUrl, selectorTabId, sessionId, pendingKey});
 
-    const openSocket = async () => {
+    const openSocket = async attempt => {
       const socket = new WebSocket(mcpRelayUrl);
       await new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          try {
-            socket.close();
-          } catch {
-            // ignore
+        let settled = false;
+        const finish = (handler) => {
+          if (settled) {
+            return;
           }
-          reject(new Error('WS_OPEN_TIMEOUT: Connection timeout'));
+          settled = true;
+          clearTimeout(timeoutId);
+          handler();
+        };
+        const timeoutId = setTimeout(() => {
+          finish(() => {
+            try {
+              socket.close();
+            } catch {
+              // ignore
+            }
+            reject(new Error('WS_OPEN_TIMEOUT: Connection timeout'));
+          });
         }, 5000);
         socket.onopen = () => {
-          clearTimeout(timeoutId);
-          resolve();
+          finish(resolve);
         };
         socket.onerror = () => {
-          clearTimeout(timeoutId);
-          try {
-            socket.close();
-          } catch {
-            // ignore
-          }
-          reject(new Error('WS_OPEN_ERROR: WebSocket error'));
+          finish(() => {
+            try {
+              socket.close();
+            } catch {
+              // ignore
+            }
+            reject(new Error(`WS_OPEN_ERROR: WebSocket error (attempt=${attempt + 1})`));
+          });
+        };
+        socket.onclose = () => {
+          finish(() => {
+            reject(new Error(`WS_OPEN_CLOSED: Socket closed before open (attempt=${attempt + 1})`));
+          });
         };
       });
       return socket;
     };
     let socket;
     let lastError;
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      logDebug('relay', `WebSocket attempt ${attempt + 1}/4`, {mcpRelayUrl});
+    const maxAttempts = 5;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      logDebug('relay', `WebSocket attempt ${attempt + 1}/${maxAttempts}`, {mcpRelayUrl});
       try {
-        socket = await openSocket();
+        socket = await openSocket(attempt);
         logInfo('relay', 'WebSocket connected', {attempt: attempt + 1});
         break;
       } catch (error) {
         lastError = error;
         logWarn('relay', `WebSocket attempt ${attempt + 1} failed`, {error: error.message});
-        await new Promise(resolve => setTimeout(resolve, 400));
+        if (attempt < maxAttempts - 1) {
+          const baseDelay = Math.min(300 * (2 ** attempt), 3000);
+          const jitter = Math.floor(Math.random() * 200);
+          const waitMs = baseDelay + jitter;
+          await new Promise(resolve => setTimeout(resolve, waitMs));
+        }
       }
     }
     if (!socket) {
@@ -392,9 +415,11 @@ class TabShareExtension {
     connection.onclose = () => {
       logInfo('relay', 'Connection closed', {selectorTabId, sessionId, pendingKey});
       this._pendingTabSelection.delete(pendingKey);
+      ensureKeepAliveAlarm('relay-connection-closed');
     };
     this._pendingTabSelection.set(pendingKey, {connection, sessionId, selectorTabId});
     logInfo('relay', 'Relay connection established', {selectorTabId, sessionId, pendingKey});
+    ensureKeepAliveAlarm('relay-connected');
   }
 
   async _connectTab(
@@ -476,6 +501,7 @@ class TabShareExtension {
     }
 
     this._pendingTabSelection.delete(pendingKey);
+    ensureKeepAliveAlarm('pending-to-active-handoff');
     const connection = newPending.connection;
     connection.setTabId(tabId);
     connection.sendReady(tabId);
@@ -487,10 +513,12 @@ class TabShareExtension {
         this._tabSessionOwners.delete(tabId);
       }
       void this._setConnectedTab(tabId, false);
+      ensureKeepAliveAlarm('active-connection-closed');
     };
     this._activeConnections.set(tabId, connection);
     this._tabSessionOwners.set(tabId, sessionId || `selector:${selectorTabId}`);
     logInfo('connect', 'Tab connected successfully', {tabId, windowId, sessionId});
+    ensureKeepAliveAlarm('tab-connected');
     // バッジのみ設定（フォーカスはMCPサーバー側が必要に応じて制御）
     await this._setConnectedTab(tabId, true);
   }
@@ -631,6 +659,7 @@ class TabShareExtension {
       this._activeConnections.delete(tabId);
       this._tabSessionOwners.delete(tabId);
       await this._setConnectedTab(tabId, false);
+      ensureKeepAliveAlarm('disconnect-single-tab');
       return;
     }
     for (const [connectedTabId, connection] of this._activeConnections) {
@@ -641,6 +670,7 @@ class TabShareExtension {
     this._activeConnections.clear();
     this._pendingTabSelection.clear();
     this._tabSessionOwners.clear();
+    ensureKeepAliveAlarm('disconnect-all');
   }
 
   _onTabRemoved(tabId) {
@@ -648,6 +678,7 @@ class TabShareExtension {
       if (pending.selectorTabId === tabId) {
         this._pendingTabSelection.delete(pendingKey);
         pending.connection.close('Browser tab closed');
+        ensureKeepAliveAlarm('pending-tab-removed');
       }
     }
     const active = this._activeConnections.get(tabId);
@@ -656,6 +687,7 @@ class TabShareExtension {
       this._activeConnections.delete(tabId);
     }
     this._tabSessionOwners.delete(tabId);
+    ensureKeepAliveAlarm('active-tab-removed');
   }
 
   _onTabActivated(activeInfo) {
@@ -684,7 +716,23 @@ class TabShareExtension {
 const tabShareExtension = new TabShareExtension();
 
 const DISCOVERY_ALARM = 'mcp-relay-discovery';
+const KEEPALIVE_ALARM = 'keepAlive';
+const KEEPALIVE_PERIOD_MINUTES = 0.5;
 const DISCOVERY_PORTS = [8765, 8766, 8767, 8768, 8769, 8770, 8771, 8772, 8773, 8774, 8775];
+const DISCOVERY_MODE = {
+  FAST: 'fast',
+  NORMAL: 'normal',
+  IDLE: 'idle',
+};
+const DISCOVERY_INTERVAL_MS = {
+  [DISCOVERY_MODE.FAST]: 500,
+  [DISCOVERY_MODE.NORMAL]: 3000,
+  [DISCOVERY_MODE.IDLE]: 15000,
+};
+const FAST_TO_NORMAL_EMPTY_STREAK = 5;
+const NORMAL_TO_IDLE_EMPTY_STREAK = 20;
+const ACTIVE_TO_IDLE_EMPTY_STREAK = 3;
+let lastSuccessfulPort = null;
 const lastRelayByPort = new Map();
 
 // Interval管理: 重複防止
@@ -692,6 +740,9 @@ let discoveryIntervalId = null;
 
 // 並列実行防止: autoOpenConnectUiが実行中かどうか
 let isDiscoveryRunning = false;
+let discoveryMode = DISCOVERY_MODE.FAST;
+let emptyDiscoveryStreak = 0;
+let keepAliveActive = false;
 
 // リロード時クールダウン: 5秒間は「新しいrelay」検出をスキップ
 const extensionStartTime = Date.now();
@@ -700,6 +751,83 @@ const COOLDOWN_MS = 5000;
 // ユーザー操作によるDiscoveryかどうかのフラグ
 // Chrome起動時やService Worker再起動時はfalse、アイコンクリック時のみtrue
 let userTriggeredDiscovery = false;
+let userTriggeredDiscoveryUntil = 0;
+
+function isUserTriggeredDiscoveryActive() {
+  if (!userTriggeredDiscovery) {
+    return false;
+  }
+  if (Date.now() > userTriggeredDiscoveryUntil) {
+    userTriggeredDiscovery = false;
+    userTriggeredDiscoveryUntil = 0;
+    return false;
+  }
+  return true;
+}
+
+function getConnectionCounts() {
+  return {
+    activeCount: tabShareExtension._activeConnections.size,
+    pendingCount: tabShareExtension._pendingTabSelection.size,
+  };
+}
+
+function shouldKeepAlive() {
+  const {activeCount, pendingCount} = getConnectionCounts();
+  return (
+    activeCount > 0 ||
+    pendingCount > 0 ||
+    discoveryIntervalId !== null ||
+    isDiscoveryRunning
+  );
+}
+
+function ensureKeepAliveAlarm(reason = 'state-change') {
+  const needed = shouldKeepAlive();
+  if (needed === keepAliveActive) {
+    return;
+  }
+  const {activeCount, pendingCount} = getConnectionCounts();
+  if (needed) {
+    chrome.alarms.create(KEEPALIVE_ALARM, {periodInMinutes: KEEPALIVE_PERIOD_MINUTES});
+    keepAliveActive = true;
+    logInfo('keepalive', 'Enabled keepAlive alarm', {reason, activeCount, pendingCount});
+    return;
+  }
+  chrome.alarms.clear(KEEPALIVE_ALARM).catch(() => {
+    // Ignore errors - alarm may not exist.
+  });
+  keepAliveActive = false;
+  logInfo('keepalive', 'Disabled keepAlive alarm', {reason, activeCount, pendingCount});
+}
+
+function getDiscoveryIntervalMs(mode = discoveryMode) {
+  return DISCOVERY_INTERVAL_MS[mode] || DISCOVERY_INTERVAL_MS[DISCOVERY_MODE.FAST];
+}
+
+function setDiscoveryMode(nextMode, reason) {
+  if (discoveryMode === nextMode) {
+    return;
+  }
+  const previousMode = discoveryMode;
+  discoveryMode = nextMode;
+  logInfo('discovery', 'Discovery mode changed', {
+    from: previousMode,
+    to: nextMode,
+    reason,
+    intervalMs: getDiscoveryIntervalMs(nextMode),
+  });
+}
+
+function getDiscoveryPortsByPriority() {
+  if (!lastSuccessfulPort || !DISCOVERY_PORTS.includes(lastSuccessfulPort)) {
+    return DISCOVERY_PORTS;
+  }
+  return [
+    lastSuccessfulPort,
+    ...DISCOVERY_PORTS.filter(port => port !== lastSuccessfulPort),
+  ];
+}
 
 
 function buildConnectUrl(
@@ -767,19 +895,24 @@ async function ensureConnectUiTab(
   return created;
 }
 
-async function fetchRelayInfo(port) {
+async function fetchRelayInfo(port, timeoutMs = 800) {
   const discoveryUrl = `http://127.0.0.1:${port}/relay-info`;
+  let timer = null;
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 800);
+    timer = setTimeout(() => controller.abort(), timeoutMs);
     const res = await fetch(discoveryUrl, {signal: controller.signal});
-    clearTimeout(timer);
     if (!res.ok) return null;
     const data = await res.json();
     if (!data?.wsUrl) return null;
+    lastSuccessfulPort = port;
     return data;
   } catch {
     return null;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -794,9 +927,10 @@ async function autoConnectRelay(best) {
   }
 
   if (best?.port) {
-    const refreshed = await fetchRelayInfo(best.port);
+    const refreshed = await fetchRelayInfo(best.port, 400);
     if (refreshed?.wsUrl) {
       best.data = refreshed;
+      lastSuccessfulPort = best.port;
       logDebug('auto-connect', 'Refreshed relay info', {wsUrl: refreshed.wsUrl, tabId: refreshed.tabId});
     }
   }
@@ -852,6 +986,9 @@ async function autoConnectRelay(best) {
       Boolean(best.data.allowTabTakeover),
     );
     logInfo('auto-connect', 'Auto-connect successful', {targetTabId, tabUrl});
+    if (best?.port) {
+      lastSuccessfulPort = best.port;
+    }
   } catch (err) {
     logError('auto-connect', 'autoConnectRelay failed', {error: err.message, tabUrl});
     debugLog('autoConnectRelay failed:', err);
@@ -864,47 +1001,53 @@ async function autoConnectRelay(best) {
 }
 
 async function autoOpenConnectUi() {
+  const result = {
+    skippedCooldown: false,
+    newRelayCount: 0,
+    successCount: 0,
+    failureCount: 0,
+  };
+
   // リロード直後はタブを開かない（既存MCPサーバーとの再接続を防ぐ）
   const elapsed = Date.now() - extensionStartTime;
   if (elapsed < COOLDOWN_MS) {
     logDebug('discovery', `Cooldown active (${elapsed}ms < ${COOLDOWN_MS}ms), skipping`);
-    return;
+    result.skippedCooldown = true;
+    return result;
   }
 
   // 複数の relay を同時にサポート（ChatGPT + Gemini）
   const newRelays = [];
-  for (const port of DISCOVERY_PORTS) {
-    const discoveryUrl = `http://127.0.0.1:${port}/relay-info`;
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 800);
-      const res = await fetch(discoveryUrl, {signal: controller.signal});
-      clearTimeout(timer);
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (!data?.wsUrl) continue;
-      const last = lastRelayByPort.get(port);
-      const startedAt = data.startedAt || 0;
-      const instanceId = data.instanceId || '';
-      if (
-        last &&
-        last.wsUrl === data.wsUrl &&
-        last.startedAt === startedAt &&
-        last.instanceId === instanceId
-      ) {
-        continue;
-      }
-      logInfo('discovery', 'New relay detected', {port, tabUrl: data.tabUrl, wsUrl: data.wsUrl});
-      lastRelayByPort.set(port, {
-        wsUrl: data.wsUrl,
-        startedAt,
-        instanceId,
-      });
-      newRelays.push({port, data});
-    } catch {
-      // ignore
+  const portsToCheck = getDiscoveryPortsByPriority();
+  for (const port of portsToCheck) {
+    const timeoutMs = port === lastSuccessfulPort ? 250 : 800;
+    const data = await fetchRelayInfo(port, timeoutMs);
+    if (!data?.wsUrl) {
+      continue;
     }
+
+    const last = lastRelayByPort.get(port);
+    const startedAt = data.startedAt || 0;
+    const instanceId = data.instanceId || '';
+    if (
+      last &&
+      last.wsUrl === data.wsUrl &&
+      last.startedAt === startedAt &&
+      last.instanceId === instanceId
+    ) {
+      continue;
+    }
+
+    logInfo('discovery', 'New relay detected', {port, tabUrl: data.tabUrl, wsUrl: data.wsUrl});
+    lastRelayByPort.set(port, {
+      wsUrl: data.wsUrl,
+      startedAt,
+      instanceId,
+    });
+    newRelays.push({port, data});
   }
+
+  result.newRelayCount = newRelays.length;
 
   if (newRelays.length > 0) {
     logInfo('discovery', `Processing ${newRelays.length} new relay(s)`);
@@ -923,9 +1066,11 @@ async function autoOpenConnectUi() {
       ok = false;
     }
     if (!ok) {
+      result.failureCount += 1;
+      const userTriggered = isUserTriggeredDiscoveryActive();
       // Only open connect.html when user explicitly clicked the extension icon
       // This prevents tab spam on Chrome restart, Service Worker restart, etc.
-      if (userTriggeredDiscovery) {
+      if (userTriggered) {
         logInfo('discovery', 'Opening connect UI', {
           port: relay.port,
           tabUrl: relay.data.tabUrl
@@ -939,14 +1084,24 @@ async function autoOpenConnectUi() {
           Boolean(relay.data.allowTabTakeover),
         );
         userTriggeredDiscovery = false;  // Reset after opening
+        userTriggeredDiscoveryUntil = 0;
       } else {
         logDebug('discovery', 'Skipping connect UI (auto mode)', {
           port: relay.port,
           tabUrl: relay.data.tabUrl
         });
       }
+      continue;
     }
+    result.successCount += 1;
   }
+
+  if (newRelays.length > 0) {
+    userTriggeredDiscovery = false;
+    userTriggeredDiscoveryUntil = 0;
+  }
+
+  return result;
 }
 
 // Discovery is now passive - only triggered by MCP server requests
@@ -961,56 +1116,126 @@ chrome.alarms.clear(DISCOVERY_ALARM).then(() => {
   // Ignore errors - alarm may not exist
 });
 
-// Keep-alive alarm to prevent Service Worker from sleeping
-const KEEPALIVE_ALARM = 'keepAlive';
+function updateDiscoveryMode(result) {
+  const {activeCount, pendingCount} = getConnectionCounts();
+  const hasRelayActivity =
+    result.newRelayCount > 0 ||
+    result.successCount > 0 ||
+    result.failureCount > 0;
 
-// 30秒間隔（periodInMinutesの最小値は0.5 = 30秒）
-chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+  if (pendingCount > 0 || hasRelayActivity) {
+    emptyDiscoveryStreak = 0;
+    setDiscoveryMode(
+      DISCOVERY_MODE.FAST,
+      pendingCount > 0 ? 'pending-connections' : 'relay-activity',
+    );
+    return;
+  }
+
+  if (result.skippedCooldown) {
+    setDiscoveryMode(DISCOVERY_MODE.FAST, 'cooldown');
+    return;
+  }
+
+  emptyDiscoveryStreak += 1;
+
+  if (activeCount > 0 && emptyDiscoveryStreak >= ACTIVE_TO_IDLE_EMPTY_STREAK) {
+    setDiscoveryMode(DISCOVERY_MODE.IDLE, 'stable-active-connections');
+    return;
+  }
+
+  if (emptyDiscoveryStreak >= NORMAL_TO_IDLE_EMPTY_STREAK) {
+    setDiscoveryMode(DISCOVERY_MODE.IDLE, 'long-idle');
+    return;
+  }
+
+  if (emptyDiscoveryStreak >= FAST_TO_NORMAL_EMPTY_STREAK) {
+    setDiscoveryMode(DISCOVERY_MODE.NORMAL, 'no-new-relays');
+    return;
+  }
+
+  setDiscoveryMode(DISCOVERY_MODE.FAST, 'probing');
+}
+
+function scheduleDiscoveryTick(delayMs) {
+  if (discoveryIntervalId !== null) {
+    return;
+  }
+  discoveryIntervalId = setTimeout(async () => {
+    discoveryIntervalId = null;
+
+    if (isDiscoveryRunning) {
+      scheduleDiscoveryTick(getDiscoveryIntervalMs());
+      return;
+    }
+
+    isDiscoveryRunning = true;
+    try {
+      const result = await autoOpenConnectUi();
+      updateDiscoveryMode(result);
+    } catch (error) {
+      logWarn('discovery', 'Discovery cycle failed', {
+        error: error?.message || String(error),
+      });
+      emptyDiscoveryStreak = 0;
+      setDiscoveryMode(DISCOVERY_MODE.FAST, 'cycle-error');
+    } finally {
+      isDiscoveryRunning = false;
+      ensureKeepAliveAlarm('discovery-cycle');
+    }
+
+    scheduleDiscoveryTick(getDiscoveryIntervalMs());
+  }, Math.max(0, delayMs));
+}
+
+function scheduleDiscovery() {
+  if (discoveryIntervalId !== null || isDiscoveryRunning) {
+    logDebug('discovery', 'Discovery already scheduled', {
+      mode: discoveryMode,
+      intervalMs: getDiscoveryIntervalMs(),
+    });
+    return;
+  }
+
+  logInfo('discovery', 'Starting discovery scheduler', {
+    mode: discoveryMode,
+    intervalMs: getDiscoveryIntervalMs(),
+  });
+  scheduleDiscoveryTick(0);
+  ensureKeepAliveAlarm('discovery-scheduled');
+}
+
+function kickDiscovery(reason) {
+  emptyDiscoveryStreak = 0;
+  setDiscoveryMode(DISCOVERY_MODE.FAST, reason);
+  if (discoveryIntervalId !== null) {
+    clearTimeout(discoveryIntervalId);
+    discoveryIntervalId = null;
+  }
+  scheduleDiscovery();
+}
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === KEEPALIVE_ALARM) {
-    const activeCount = tabShareExtension._activeConnections.size;
-    const pendingCount = tabShareExtension._pendingTabSelection.size;
+    const {activeCount, pendingCount} = getConnectionCounts();
     if (activeCount > 0 || pendingCount > 0) {
-      logDebug('keepalive', 'Alarm triggered', { activeCount, pendingCount });
+      logDebug('keepalive', 'Alarm triggered', {activeCount, pendingCount});
     }
 
-    // Service Worker復帰時: discoveryIntervalIdは値を保持するが
-    // setIntervalは停止している。intervalをリセットして再スケジュール
-    if (discoveryIntervalId !== null) {
-      logInfo('keepalive', 'Resetting discovery interval after SW wake');
-      discoveryIntervalId = null;  // クリアして再スケジュール可能に
+    if (!shouldKeepAlive()) {
+      ensureKeepAliveAlarm('alarm-prune');
+      return;
     }
-    scheduleDiscovery();
+
+    if (discoveryIntervalId === null && !isDiscoveryRunning) {
+      logInfo('keepalive', 'Re-arming discovery scheduler after wake');
+      scheduleDiscovery();
+    }
   }
 });
 
 // Note: We no longer register an onAlarm listener for DISCOVERY_ALARM
 // The scheduleDiscovery function is only called on explicit MCP requests
-
-// scheduleDiscovery is called only when MCP server explicitly requests connection
-// Note: Infinite polling while extension is alive - no timeout limit
-function scheduleDiscovery() {
-  // 重複防止: 既にintervalが動いていれば何もしない
-  if (discoveryIntervalId !== null) {
-    logInfo('discovery', 'Discovery already running, skipping duplicate call');
-    return;
-  }
-
-  logInfo('discovery', 'scheduleDiscovery called - starting infinite polling');
-  autoOpenConnectUi();
-  // 無制限ポーリング（拡張機能が生きている限り継続）
-  // 並列実行防止: 前の実行が完了するまで次の実行をスキップ
-  discoveryIntervalId = setInterval(async () => {
-    if (isDiscoveryRunning) return;  // Skip if previous run is still in progress
-    isDiscoveryRunning = true;
-    try {
-      await autoOpenConnectUi();
-    } finally {
-      isDiscoveryRunning = false;
-    }
-  }, 500);
-}
 
 // Discovery auto-starts on Chrome startup
 // connect.html only opens when user clicks the extension icon
@@ -1020,7 +1245,8 @@ function scheduleDiscovery() {
 chrome.action.onClicked.addListener(() => {
   logInfo('action', 'Extension icon clicked - starting discovery');
   userTriggeredDiscovery = true;  // ユーザーが明示的にトリガー
-  scheduleDiscovery();
+  userTriggeredDiscoveryUntil = Date.now() + 15000;
+  kickDiscovery('user-click');
 });
 
 // Auto-start discovery on install/startup
