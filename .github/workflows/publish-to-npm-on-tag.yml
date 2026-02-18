@@ -1,9 +1,7 @@
 name: publish-on-tag
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 permissions:
   id-token: write # Required for OIDC
@@ -41,7 +39,15 @@ jobs:
         run: npm run build
 
       - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if npm view "${PKG_NAME}@${PKG_VERSION}" version >/dev/null 2>&1; then
+            echo "Version ${PKG_NAME}@${PKG_VERSION} already published; skipping duplicate publish."
+            exit 0
+          fi
           npm publish --provenance --access public
 
   publish-to-mcp-registry:
