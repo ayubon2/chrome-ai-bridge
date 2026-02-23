@@ -431,6 +431,17 @@ export class RelayServer extends EventEmitter {
       this.discoveryPort = null;
     }
 
+    // Clean up relay info file if it belongs to this session
+    try {
+      const relayInfoPath = '/tmp/chrome-ai-bridge-relay.json';
+      if (fs.existsSync(relayInfoPath)) {
+        const info = JSON.parse(fs.readFileSync(relayInfoPath, 'utf-8'));
+        if (info.sessionId === this.sessionId) {
+          fs.unlinkSync(relayInfoPath);
+        }
+      }
+    } catch { /* ignore */ }
+
     if (this.wss) {
       return new Promise((resolve) => {
         this.wss!.close(() => {

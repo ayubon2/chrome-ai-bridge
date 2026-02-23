@@ -13,6 +13,8 @@ import {
   getAllAgentConnections,
   clearAllAgentConnections,
   hasAgentId,
+  setAgentId,
+  generateAgentId,
   type AgentConnection,
 } from './agent-context.js';
 import {saveAgentSession, getPreferredSessionV2, clearAgentSession} from './session-manager.js';
@@ -601,23 +603,36 @@ async function createConnection(kind: 'chatgpt' | 'gemini'): Promise<CdpClient> 
  * @public 外部から接続を事前確立するためにエクスポート
  */
 export async function getClient(kind: 'chatgpt' | 'gemini'): Promise<CdpClient> {
+  // Ensure agent ID is set for connection tracking
+  if (!hasAgentId()) {
+    setAgentId(generateAgentId());
+  }
+
   const existing = getClientFromAgent(kind);
   logInfo('fast-chat', `getClient called`, {kind, hasExisting: !!existing});
 
   // 既存接続がある場合、健全性をチェック
   if (existing) {
-    logInfo('fast-chat', `Checking health of existing ${kind} connection`);
-    const healthy = await isConnectionHealthy(existing, kind);
-    if (healthy) {
-      logInfo('fast-chat', `Reusing healthy ${kind} connection`);
-      console.error(`[fast-cdp] Reusing healthy ${kind} connection`);
-      return existing;
-    }
+    const relay = getRelayFromAgent(kind);
+    if (!relay?.isReady()) {
+      // Relay が ready でなければヘルスチェック不要、即リセット
+      logInfo('fast-chat', `${kind} relay not ready, skipping health check`);
+      console.error(`[fast-cdp] ${kind} relay not ready, performing immediate reset...`);
+      await resetConnection(kind);
+    } else {
+      logInfo('fast-chat', `Checking health of existing ${kind} connection`);
+      const healthy = await isConnectionHealthy(existing, kind);
+      if (healthy) {
+        logInfo('fast-chat', `Reusing healthy ${kind} connection`);
+        console.error(`[fast-cdp] Reusing healthy ${kind} connection`);
+        return existing;
+      }
 
-    // 接続が切れている → 協調クリーンアップして再接続
-    logConnectionState(kind, 'reconnecting');
-    console.error(`[fast-cdp] ${kind} connection lost, performing coordinated reset...`);
-    await resetConnection(kind);
+      // 接続が切れている → 協調クリーンアップして再接続
+      logConnectionState(kind, 'reconnecting');
+      console.error(`[fast-cdp] ${kind} connection lost, performing coordinated reset...`);
+      await resetConnection(kind);
+    }
   }
 
   // 新しい接続を作成

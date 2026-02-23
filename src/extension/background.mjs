@@ -514,6 +514,7 @@ class TabShareExtension {
       }
       void this._setConnectedTab(tabId, false);
       ensureKeepAliveAlarm('active-connection-closed');
+      kickDiscovery('connection-closed');
     };
     this._activeConnections.set(tabId, connection);
     this._tabSessionOwners.set(tabId, sessionId || `selector:${selectorTabId}`);
@@ -956,14 +957,21 @@ async function autoConnectRelay(best) {
     logWarn('auto-connect', 'No targetTabId resolved');
     return false;
   }
+  const sessionId = best?.data?.sessionId || null;
   if (tabShareExtension._activeConnections?.has(targetTabId)) {
-    logInfo('auto-connect', 'Tab already connected', {targetTabId});
-    return true; // 既に接続済み
+    const existingSession = tabShareExtension._tabSessionOwners?.get(targetTabId);
+    if (existingSession && sessionId && existingSession !== sessionId) {
+      logInfo('auto-connect', 'Tab connected to different session, will replace', {
+        targetTabId, existingSession, newSessionId: sessionId,
+      });
+      // _connectTab() が既存接続を適切に置換するので、フォールスルー
+    } else {
+      logInfo('auto-connect', 'Tab already connected with same session', {targetTabId, sessionId: existingSession});
+      return true;
+    }
   }
 
   const targetTab = await chrome.tabs.get(targetTabId).catch(() => null);
-
-  const sessionId = best?.data?.sessionId || null;
   // selectorId は後方互換のため保持。sessionId がある場合は session 軸を優先する。
   const selectorId = `auto:${best.data.wsUrl}`;
   logInfo('auto-connect', 'Attempting auto-connect', {
