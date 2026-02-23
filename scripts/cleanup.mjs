@@ -65,14 +65,15 @@ async function main() {
   }
   console.log();
 
-  // Target only main.js processes (cli.mjs wrappers will exit when main.js dies)
+  // Target index.js (entry point) and main.js processes
+  // Note: process runs as `node build/src/index.js` (index.ts imports main.ts)
   const targets = allProcs
-    .filter(p => p.cmd.includes('main.js'))
+    .filter(p => p.cmd.includes('index.js') || p.cmd.includes('main.js'))
     .map(p => p.pid)
     .filter(pid => pid !== process.pid);
 
   if (targets.length === 0) {
-    console.log('[cleanup] No main.js processes to kill.');
+    console.log('[cleanup] No chrome-ai-bridge server processes to kill.');
     removeLock();
     return;
   }

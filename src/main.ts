@@ -102,7 +102,7 @@ function countLocalBridgeInstances(): number {
     return lines.filter(
       line =>
         line.includes('chrome-ai-bridge') &&
-        (line.includes('build/src/main.js') || line.includes('scripts/cli.mjs')),
+        (line.includes('build/src/index.js') || line.includes('build/src/main.js') || line.includes('scripts/cli.mjs')),
     ).length;
   } catch {
     return 0;
